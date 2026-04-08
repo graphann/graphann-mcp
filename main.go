@@ -43,7 +43,7 @@ func main() {
 
 	if *version {
 		// stdout is safe here: we're exiting before the MCP loop starts.
-		_, _ = os.Stdout.WriteString("graphann-mcp v0.1.0\n")
+		_, _ = os.Stdout.WriteString("graphann-mcp v0.2.0\n")
 		return
 	}
 
@@ -69,6 +69,8 @@ func main() {
 	registerStore(server, client)
 	registerSearch(server, client)
 	registerRecall(server, client)
+	registerForget(server, client)
+	registerListRecent(server, client)
 
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("server exited: %v", err)

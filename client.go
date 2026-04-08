@@ -350,3 +350,87 @@ func (c *Client) Search(ctx context.Context, query string, k int) (*SearchRespon
 
 // IDs exposes the resolved server-side IDs for diagnostics.
 func (c *Client) IDs() (tenant, index string) { return c.tenantID, c.indexID }
+
+// ---- Delete / Get / Stats (v0.2 endpoints) ------------------------------
+
+// LiveStatsResponse is the decoded response from GET /live-stats. The
+// Documents field is the total count of documents ever added, including
+// tombstoned ones — useful for walking the monotonic doc_id space.
+type LiveStatsResponse struct {
+	IndexID       string `json:"index_id"`
+	BaseChunks    int    `json:"base_chunks"`
+	DeltaChunks   int    `json:"delta_chunks"`
+	LiveChunks    int    `json:"live_chunks"`
+	TotalChunks   int    `json:"total_chunks"`
+	DeletedChunks int    `json:"deleted_chunks"`
+	Documents     int    `json:"documents"`
+	Dimension     int    `json:"dimension"`
+	IsDirty       bool   `json:"is_dirty"`
+	IsLive        bool   `json:"is_live"`
+}
+
+// LiveStats fetches document / chunk counts for the configured index.
+func (c *Client) LiveStats(ctx context.Context) (*LiveStatsResponse, error) {
+	var out LiveStatsResponse
+	path := fmt.Sprintf("/v1/tenants/%s/indexes/%s/live-stats", c.tenantID, c.indexID)
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DocumentChunk mirrors the per-chunk entries returned by GET /documents/{id}.
+type DocumentChunk struct {
+	UUID       string `json:"uuid"`
+	Text       string `json:"text"`
+	FilePath   string `json:"file_path"`
+	CommitSHA  string `json:"commit_sha"`
+	RepoID     string `json:"repo_id"`
+	ChunkID    int    `json:"chunk_id"`
+	ChunkIndex int    `json:"chunk_index"`
+	Start      int    `json:"start"`
+	End        int    `json:"end"`
+}
+
+// GetDocumentResponse is the decoded response from GET /documents/{id}.
+type GetDocumentResponse struct {
+	IndexID     string          `json:"index_id"`
+	ExternalID  string          `json:"external_id"`
+	Chunks      []DocumentChunk `json:"chunks"`
+	DocumentID  int             `json:"document_id"`
+	TotalChunks int             `json:"total_chunks"`
+}
+
+// GetDocument fetches a document and its chunks by integer document ID.
+// Returns (nil, nil) if the document does not exist (HTTP 404), so callers
+// walking a range can distinguish "missing" from "error".
+func (c *Client) GetDocument(ctx context.Context, docID int) (*GetDocumentResponse, error) {
+	var out GetDocumentResponse
+	path := fmt.Sprintf("/v1/tenants/%s/indexes/%s/documents/%d", c.tenantID, c.indexID, docID)
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteDocumentResponse mirrors the shape returned by DELETE /documents/{id}.
+type DeleteDocumentResponse struct {
+	IndexID       string `json:"index_id"`
+	DocumentID    int    `json:"document_id"`
+	DeletedChunks int    `json:"deleted_chunks"`
+}
+
+// DeleteDocument removes a single document by integer ID. Tombstones the
+// underlying chunks; live_chunks decreases, total_chunks is unchanged.
+func (c *Client) DeleteDocument(ctx context.Context, docID int) (*DeleteDocumentResponse, error) {
+	var out DeleteDocumentResponse
+	path := fmt.Sprintf("/v1/tenants/%s/indexes/%s/documents/%d", c.tenantID, c.indexID, docID)
+	if err := c.doJSON(ctx, http.MethodDelete, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}

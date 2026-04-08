@@ -140,6 +140,165 @@ func registerRecall(server *mcp.Server, client *Client) {
 	})
 }
 
+// ---- memory_forget ------------------------------------------------------
+
+// forgetConfidence is the minimum similarity score required to confidently
+// forget the top search match. Below this threshold, memory_forget refuses
+// and shows a preview so the caller can refine the query.
+const forgetConfidence = 0.85
+
+// ForgetArgs is the schema for the memory_forget tool.
+type ForgetArgs struct {
+	Query string `json:"query" jsonschema:"natural-language description of the memory to forget. Must confidently identify a single memory — refine the query if results are ambiguous."`
+}
+
+// registerForget wires the memory_forget tool. Looks up the top-ranked
+// memory for the query, deletes it by its underlying document_id if the
+// similarity score is confident, otherwise returns a preview and refuses.
+func registerForget(server *mcp.Server, client *Client) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "memory_forget",
+		Description: "Delete a memory from long-term storage by natural-language query. " +
+			"The top-ranked match is removed only when the similarity score is high enough to be unambiguous. " +
+			"Use when the user explicitly asks you to forget something, or when a stored memory is outdated and needs removal.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args ForgetArgs) (*mcp.CallToolResult, any, error) {
+		q := strings.TrimSpace(args.Query)
+		if q == "" {
+			return errorResult("query is required and must be non-empty"), nil, nil
+		}
+		if err := client.Bootstrap(ctx); err != nil {
+			return errorResult(fmt.Sprintf("bootstrap: %v", err)), nil, nil
+		}
+		resp, err := client.Search(ctx, q, 3)
+		if err != nil {
+			return errorResult(fmt.Sprintf("forget: search failed: %v", err)), nil, nil
+		}
+		if resp == nil || len(resp.Results) == 0 {
+			return textResult(fmt.Sprintf("No memory matches %q — nothing to forget.", q)), nil, nil
+		}
+		top := resp.Results[0]
+		if top.Score < forgetConfidence {
+			return errorResult(fmt.Sprintf(
+				"Refusing to forget — top match score %.2f is below confidence threshold %.2f.\nCandidate: %s\nRefine the query to match the exact memory you want to delete.",
+				top.Score, forgetConfidence, truncate(stripTagPrefix(top.Text), 200),
+			)), nil, nil
+		}
+		docID, ok := docIDFromMetadata(top.Metadata)
+		if !ok {
+			return errorResult(fmt.Sprintf("forget: top match %s has no document_id in metadata; cannot delete", top.ID)), nil, nil
+		}
+		del, err := client.DeleteDocument(ctx, docID)
+		if err != nil {
+			return errorResult(fmt.Sprintf("forget: delete failed: %v", err)), nil, nil
+		}
+		return textResult(fmt.Sprintf(
+			"Forgot memory (document_id %d, %d chunk(s)) with similarity %.2f:\n  %s",
+			del.DocumentID, del.DeletedChunks, top.Score, truncate(stripTagPrefix(top.Text), 200),
+		)), nil, nil
+	})
+}
+
+// ---- memory_list_recent -------------------------------------------------
+
+// ListRecentArgs is the schema for the memory_list_recent tool.
+type ListRecentArgs struct {
+	K int `json:"k,omitempty" jsonschema:"maximum number of recent items to return (default 10, max 50)"`
+}
+
+// registerListRecent wires the memory_list_recent tool. GraphANN lacks a
+// time-ordered browse endpoint, so we walk the monotonic document_id space
+// from highest to lowest using GetDocument, skipping tombstoned entries.
+// This is "newest first" under the assumption that document_ids are
+// assigned in ingest order — which matches GraphANN's current behaviour.
+func registerListRecent(server *mcp.Server, client *Client) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "memory_list_recent",
+		Description: "List the most recently stored memories in this project, newest first. " +
+			"Use when the user asks 'what did I just remember' or when you want to see fresh context without a specific query. " +
+			"Returns at most k items, skipping any that have been forgotten.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args ListRecentArgs) (*mcp.CallToolResult, any, error) {
+		k := args.K
+		if k <= 0 {
+			k = 10
+		}
+		if k > 50 {
+			k = 50
+		}
+		if err := client.Bootstrap(ctx); err != nil {
+			return errorResult(fmt.Sprintf("bootstrap: %v", err)), nil, nil
+		}
+		stats, err := client.LiveStats(ctx)
+		if err != nil {
+			return errorResult(fmt.Sprintf("list_recent: live-stats failed: %v", err)), nil, nil
+		}
+		if stats.Documents == 0 {
+			return textResult("No memories stored in this project yet."), nil, nil
+		}
+		// Walk from highest doc_id down. Give up after 3*k lookups to avoid
+		// pathological scans of heavily-tombstoned indexes.
+		maxLookups := k * 3
+		if maxLookups < 20 {
+			maxLookups = 20
+		}
+		type item struct {
+			docID int
+			text  string
+		}
+		items := make([]item, 0, k)
+		lookups := 0
+		for id := stats.Documents - 1; id >= 0 && len(items) < k && lookups < maxLookups; id-- {
+			lookups++
+			doc, derr := client.GetDocument(ctx, id)
+			if derr != nil {
+				continue // transient — keep walking
+			}
+			if doc == nil || len(doc.Chunks) == 0 {
+				continue // tombstoned
+			}
+			// Concatenate chunk text in chunk-index order (GraphANN already sorts).
+			var txt strings.Builder
+			for i, ch := range doc.Chunks {
+				if i > 0 {
+					txt.WriteString(" ")
+				}
+				txt.WriteString(ch.Text)
+			}
+			items = append(items, item{docID: id, text: stripTagPrefix(txt.String())})
+		}
+		if len(items) == 0 {
+			return textResult("No live memories found in the most recent document range."), nil, nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "[Memory: %d recent item(s) out of %d total documents]\n",
+			len(items), stats.Documents)
+		for i, it := range items {
+			fmt.Fprintf(&b, "%d. (doc %d) %s\n", i+1, it.docID, truncate(it.text, 300))
+		}
+		return textResult(b.String()), nil, nil
+	})
+}
+
+// docIDFromMetadata extracts the integer document_id from a search result's
+// metadata map. GraphANN returns it as a float64 under JSON decoding.
+func docIDFromMetadata(md map[string]any) (int, bool) {
+	if md == nil {
+		return 0, false
+	}
+	raw, ok := md["document_id"]
+	if !ok {
+		return 0, false
+	}
+	switch v := raw.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	}
+	return 0, false
+}
+
 // ---- formatting helpers -------------------------------------------------
 
 // textResult wraps a plain-text response into an MCP CallToolResult.
