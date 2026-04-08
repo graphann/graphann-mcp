@@ -1,0 +1,14 @@
+# Linter configuration for graphann-mcp.
+#
+# The default govet configuration in this repo disables the fieldalignment
+# analyzer. It fires on anonymous test tables and on small, rarely-allocated
+# structs where the memory saving is measured in single-digit bytes. The
+# resulting churn outweighs the benefit for a project this size.
+
+version: "2"
+
+linters:
+  settings:
+    govet:
+      disable:
+        - fieldalignment
