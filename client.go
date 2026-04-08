@@ -61,8 +61,47 @@ func (e *apiError) Error() string {
 
 // doJSON issues a JSON request and decodes the response body into out (if
 // non-nil). A nil body sends no request body. Non-2xx responses are returned
-// as *apiError so callers can inspect Status/Code.
+// as *apiError so callers can inspect Status/Code. Requests that hit the
+// transient 503 "index_not_ready" state — common immediately after creating
+// or restarting an index — are retried with exponential backoff up to
+// indexNotReadyRetryBudget so callers don't need to know about the race.
 func (c *Client) doJSON(ctx context.Context, method, path string, body, out any) error {
+	const (
+		indexNotReadyRetryBudget = 20 * time.Second
+		initialBackoff           = 200 * time.Millisecond
+		maxBackoff               = 2 * time.Second
+	)
+	deadline := time.Now().Add(indexNotReadyRetryBudget)
+	backoff := initialBackoff
+	for {
+		err := c.doJSONOnce(ctx, method, path, body, out)
+		if err == nil {
+			return nil
+		}
+		var e *apiError
+		if !asAPIError(err, &e) || e.Status != http.StatusServiceUnavailable || e.Code != "index_not_ready" {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
+}
+
+// doJSONOnce is the single-attempt HTTP worker behind doJSON. Kept separate
+// so the retry loop above can wrap it without recursion.
+func (c *Client) doJSONOnce(ctx context.Context, method, path string, body, out any) error {
 	var bodyReader io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
@@ -199,58 +238,13 @@ func (c *Client) bootstrap(ctx context.Context) error {
 		return fmt.Errorf("lookup index %q: %w", expectedIndexID, err)
 	}
 
-	// Newly-created indexes briefly report status=pending|building before
-	// they can serve search queries. Poll until ready or timeout. Already-
-	// existing ready indexes short-circuit on the first check.
-	if freshlyCreated || !strings.EqualFold(idx.Status, "ready") {
-		if err := c.waitIndexReady(ctx); err != nil {
-			return err
-		}
-	}
+	// We deliberately do NOT block here waiting for the index to reach the
+	// "ready" status. A brand-new empty index stays in "pending" until the
+	// first ingest triggers its build, so polling for ready before any
+	// writes would deadlock. Instead, doJSON retries transparently on
+	// HTTP 503 "index_not_ready" for any call that races the transition.
+	_ = freshlyCreated
 	return nil
-}
-
-// waitIndexReady polls the index status endpoint until it reports "ready"
-// or the poll timeout expires. Required because a just-created index
-// returns HTTP 503 index_not_ready for its first few hundred milliseconds.
-func (c *Client) waitIndexReady(ctx context.Context) error {
-	const (
-		pollInterval = 200 * time.Millisecond
-		pollTimeout  = 15 * time.Second
-	)
-	deadline := time.Now().Add(pollTimeout)
-	path := fmt.Sprintf("/v1/tenants/%s/indexes/%s/status", c.tenantID, c.indexID)
-	var statusResp struct {
-		IndexID string `json:"index_id"`
-		Status  string `json:"status"`
-		Error   string `json:"error"`
-	}
-	for {
-		err := c.doJSON(ctx, http.MethodGet, path, nil, &statusResp)
-		if err != nil {
-			var e *apiError
-			if !asAPIError(err, &e) || (e.Status != http.StatusNotFound && e.Status != http.StatusServiceUnavailable) {
-				return fmt.Errorf("poll index status: %w", err)
-			}
-			// else: transient during creation, fall through and retry
-		} else {
-			switch strings.ToLower(statusResp.Status) {
-			case "ready":
-				return nil
-			case "error":
-				return fmt.Errorf("index %s entered error state: %s", c.indexID, statusResp.Error)
-			}
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("index %s not ready after %s (last status: %q)",
-				c.indexID, pollTimeout, statusResp.Status)
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pollInterval):
-		}
-	}
 }
 
 // isNotFound reports whether err is an *apiError with 404 status or a
