@@ -9,11 +9,18 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// dedupThreshold controls write-time dedup. If the nearest neighbour to a
-// new memory scores above this value, the store is skipped. The live
-// instance returns hybrid scores in roughly [0, 1] with near-duplicates
-// landing above ~0.9.
-const dedupThreshold = 0.92
+const (
+	searchDefaultK = 10
+	searchMaxK     = 100
+	recallDefaultK = 5
+	recallMaxK     = 20
+	recentDefaultK = 10
+	recentMaxK     = 50
+
+	recallSnippetLen = 300
+	searchSnippetLen = 400
+	forgetSnippetLen = 200
+)
 
 // ---- memory_store -------------------------------------------------------
 
@@ -27,44 +34,26 @@ type StoreArgs struct {
 	Tags   []string `json:"tags,omitempty" jsonschema:"optional free-form tags for filtering and future retrieval. Short lowercase words are best."`
 }
 
-// registerStore wires the memory_store tool onto the MCP server.
-func registerStore(server *mcp.Server, client *Client) {
+func registerStore(server *mcp.Server, mem *Memory) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "memory_store",
 		Description: "Persist a fact, preference, decision, or note into the current project's long-term memory. " +
 			"Use when the user tells you something worth remembering across sessions, " +
 			"when you make a notable decision, or when you discover context that future sessions will need. " +
-			"Writes are deduplicated against the nearest existing memory — near-identical content is skipped.",
+			"Writes are deduplicated: a memory that states the same thing as an existing one is skipped. " +
+			"A changed or contradicting statement is stored as a new memory — forget the outdated one.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args StoreArgs) (*mcp.CallToolResult, any, error) {
-		text := strings.TrimSpace(args.Text)
-		if text == "" {
-			return errorResult("text is required and must be non-empty"), nil, nil
-		}
-		if err := client.Bootstrap(ctx); err != nil {
-			return errorResult(fmt.Sprintf("bootstrap: %v", err)), nil, nil
-		}
-
-		// dedup against nearest neighbour
-		if existing, err := client.Search(ctx, text, 1); err == nil && len(existing.Results) > 0 {
-			top := existing.Results[0]
-			if top.Score >= dedupThreshold {
-				return textResult(fmt.Sprintf(
-					"Skipped — near-duplicate of existing memory %s (similarity %.2f):\n  %s",
-					top.ID, top.Score, truncate(stripTagPrefix(top.Text), 160),
-				)), nil, nil
-			}
-		}
-
-		encoded := encodeMemoryText(args.Kind, args.Tags, args.Source, text)
-		resp, err := client.AddDocuments(ctx, []Document{{Text: encoded}})
+		res, err := mem.Store(ctx, args)
 		if err != nil {
-			return errorResult(fmt.Sprintf("store: %v", err)), nil, nil
+			return errorResult(err.Error()), nil, nil
 		}
-		if resp.Added == 0 || len(resp.ChunkIDs) == 0 {
-			return errorResult("store: GraphANN reported 0 documents added"), nil, nil
+		if res.Duplicate != nil {
+			return textResult(fmt.Sprintf(
+				"Skipped — already stored as memory %s (similarity %.2f):\n  %s",
+				hitLabel(*res.Duplicate), res.Duplicate.Score, truncate(stripTagPrefix(res.Duplicate.Text), forgetSnippetLen),
+			)), nil, nil
 		}
-		_, indexID := client.IDs()
-		return textResult(fmt.Sprintf("Stored memory %s in index %s.", resp.ChunkIDs[0], indexID)), nil, nil
+		return textResult(fmt.Sprintf("Stored memory %s in index %s.", res.ChunkID, mem.IndexID)), nil, nil
 	})
 }
 
@@ -76,28 +65,25 @@ type SearchArgs struct {
 	K     int    `json:"k,omitempty" jsonschema:"maximum number of results (default 10, max 100)"`
 }
 
-// registerSearch wires the memory_search tool. It returns ranked results
-// verbatim with similarity scores — useful when the caller wants to reason
-// about what's in memory, not just pull context for the current task.
-func registerSearch(server *mcp.Server, client *Client) {
+func registerSearch(server *mcp.Server, mem *Memory) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "memory_search",
-		Description: "Search long-term memory and return ranked results with similarity scores. " +
+		Description: "Search long-term memory and return ranked results with similarity scores and ids. " +
 			"Use this when you want to inspect what's in memory, compare multiple candidates, or reason about " +
 			"whether a fact exists. For pulling context into the current task, prefer memory_recall instead.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args SearchArgs) (*mcp.CallToolResult, any, error) {
-		q := strings.TrimSpace(args.Query)
-		if q == "" {
-			return errorResult("query is required and must be non-empty"), nil, nil
+		q, res := requireQuery(args.Query)
+		if res != nil {
+			return res, nil, nil
 		}
-		if err := client.Bootstrap(ctx); err != nil {
+		if err := mem.Ensure(ctx); err != nil {
 			return errorResult(fmt.Sprintf("bootstrap: %v", err)), nil, nil
 		}
-		resp, err := client.Search(ctx, q, args.K)
+		hits, err := mem.Query(ctx, q, clampK(args.K, searchDefaultK, searchMaxK), queryOpts{Collapse: true})
 		if err != nil {
 			return errorResult(fmt.Sprintf("search: %v", err)), nil, nil
 		}
-		return textResult(formatSearchResults(q, resp)), nil, nil
+		return textResult(formatSearchResults(q, hits)), nil, nil
 	})
 }
 
@@ -109,92 +95,56 @@ type RecallArgs struct {
 	K     int    `json:"k,omitempty" jsonschema:"maximum number of items to return (default 5, max 20)"`
 }
 
-// registerRecall wires the memory_recall tool. It produces a compact,
-// human-readable context block ready to drop into the model's reasoning.
-func registerRecall(server *mcp.Server, client *Client) {
+func registerRecall(server *mcp.Server, mem *Memory) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "memory_recall",
 		Description: "Recall the most relevant memories for the current task as a compact context block. " +
 			"Call this at the start of work on a project or when the user references something you don't have in " +
 			"current context. Returns fewer, cleaner results than memory_search — optimised for direct use.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args RecallArgs) (*mcp.CallToolResult, any, error) {
-		q := strings.TrimSpace(args.Query)
-		if q == "" {
-			return errorResult("query is required and must be non-empty"), nil, nil
+		q, res := requireQuery(args.Query)
+		if res != nil {
+			return res, nil, nil
 		}
-		k := args.K
-		if k <= 0 {
-			k = 5
-		}
-		if k > 20 {
-			k = 20
-		}
-		if err := client.Bootstrap(ctx); err != nil {
+		if err := mem.Ensure(ctx); err != nil {
 			return errorResult(fmt.Sprintf("bootstrap: %v", err)), nil, nil
 		}
-		resp, err := client.Search(ctx, q, k)
+		hits, err := mem.Query(ctx, q, clampK(args.K, recallDefaultK, recallMaxK), defaultQueryOpts)
 		if err != nil {
 			return errorResult(fmt.Sprintf("recall: %v", err)), nil, nil
 		}
-		return textResult(formatRecall(q, resp)), nil, nil
+		return textResult(formatRecall(q, hits)), nil, nil
 	})
 }
 
 // ---- memory_forget ------------------------------------------------------
 
-// forgetConfidence is the minimum similarity score required to confidently
-// forget the top search match. Below this threshold, memory_forget refuses
-// and shows a preview so the caller can refine the query.
-const forgetConfidence = 0.85
-
 // ForgetArgs is the schema for the memory_forget tool.
 type ForgetArgs struct {
-	Query string `json:"query" jsonschema:"natural-language description of the memory to forget. Must confidently identify a single memory — refine the query if results are ambiguous."`
+	ID    *int   `json:"id,omitempty" jsonschema:"optional document id (the #N shown by memory_search, memory_recall and memory_list_recent). Deletes exactly that memory; takes precedence over query."`
+	Query string `json:"query,omitempty" jsonschema:"natural-language description of the memory to forget. Must confidently identify a single memory — refine the query or pass id if results are ambiguous."`
 }
 
-// registerForget wires the memory_forget tool. Looks up the top-ranked
-// memory for the query, deletes it by its underlying document_id if the
-// similarity score is confident, otherwise returns a preview and refuses.
-func registerForget(server *mcp.Server, client *Client) {
+func registerForget(server *mcp.Server, mem *Memory) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "memory_forget",
-		Description: "Delete a memory from long-term storage by natural-language query. " +
-			"The top-ranked match is removed only when the similarity score is high enough to be unambiguous. " +
+		Description: "Delete a memory from long-term storage, by document id or by natural-language query. " +
+			"A query deletes the top match only when it is confident and clearly ahead of the runner-up; otherwise candidates are listed so you can retry with an id. " +
 			"Use when the user explicitly asks you to forget something, or when a stored memory is outdated and needs removal.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ForgetArgs) (*mcp.CallToolResult, any, error) {
 		q := strings.TrimSpace(args.Query)
-		if q == "" {
-			return errorResult("query is required and must be non-empty"), nil, nil
+		if q == "" && args.ID == nil {
+			return errorResult("query or id is required"), nil, nil
 		}
-		if err := client.Bootstrap(ctx); err != nil {
-			return errorResult(fmt.Sprintf("bootstrap: %v", err)), nil, nil
-		}
-		resp, err := client.Search(ctx, q, 3)
+		res, err := mem.Forget(ctx, q, args.ID)
 		if err != nil {
-			return errorResult(fmt.Sprintf("forget: search failed: %v", err)), nil, nil
+			return errorResult(err.Error()), nil, nil
 		}
-		if resp == nil || len(resp.Results) == 0 {
-			return textResult(fmt.Sprintf("No memory matches %q — nothing to forget.", q)), nil, nil
+		if res.Refused != "" {
+			return textResult(formatForgetRefusal(q, res)), nil, nil
 		}
-		top := resp.Results[0]
-		if top.Score < forgetConfidence {
-			return errorResult(fmt.Sprintf(
-				"Refusing to forget — top match score %.2f is below confidence threshold %.2f.\nCandidate: %s\nRefine the query to match the exact memory you want to delete.",
-				top.Score, forgetConfidence, truncate(stripTagPrefix(top.Text), 200),
-			)), nil, nil
-		}
-		docID, ok := docIDFromMetadata(top.Metadata)
-		if !ok {
-			return errorResult(fmt.Sprintf("forget: top match %s has no document_id in metadata; cannot delete", top.ID)), nil, nil
-		}
-		del, err := client.DeleteDocument(ctx, docID)
-		if err != nil {
-			return errorResult(fmt.Sprintf("forget: delete failed: %v", err)), nil, nil
-		}
-		return textResult(fmt.Sprintf(
-			"Forgot memory (document_id %d, %d chunk(s)) with similarity %.2f:\n  %s",
-			del.DocumentID, del.DeletedChunks, top.Score, truncate(stripTagPrefix(top.Text), 200),
-		)), nil, nil
+		return textResult(fmt.Sprintf("Forgot memory %s (%d chunk(s)):\n  %s",
+			hitLabel(res.Deleted), res.Chunks, truncate(stripTagPrefix(res.Deleted.Text), forgetSnippetLen))), nil, nil
 	})
 }
 
@@ -205,90 +155,61 @@ type ListRecentArgs struct {
 	K int `json:"k,omitempty" jsonschema:"maximum number of recent items to return (default 10, max 50)"`
 }
 
-// registerListRecent wires the memory_list_recent tool. GraphANN lacks a
-// time-ordered browse endpoint, so we walk the monotonic document_id space
-// from highest to lowest using GetDocument, skipping tombstoned entries.
-// This is "newest first" under the assumption that document_ids are
-// assigned in ingest order — which matches GraphANN's current behaviour.
-func registerListRecent(server *mcp.Server, client *Client) {
+func registerListRecent(server *mcp.Server, mem *Memory) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "memory_list_recent",
 		Description: "List the most recently stored memories in this project, newest first. " +
 			"Use when the user asks 'what did I just remember' or when you want to see fresh context without a specific query. " +
 			"Returns at most k items, skipping any that have been forgotten.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args ListRecentArgs) (*mcp.CallToolResult, any, error) {
-		k := args.K
-		if k <= 0 {
-			k = 10
-		}
-		if k > 50 {
-			k = 50
-		}
-		if err := client.Bootstrap(ctx); err != nil {
-			return errorResult(fmt.Sprintf("bootstrap: %v", err)), nil, nil
-		}
-		stats, err := client.LiveStats(ctx)
+		items, total, err := mem.ListRecent(ctx, clampK(args.K, recentDefaultK, recentMaxK))
 		if err != nil {
-			return errorResult(fmt.Sprintf("list_recent: live-stats failed: %v", err)), nil, nil
+			return errorResult(err.Error()), nil, nil
 		}
-		if stats.Documents == 0 {
+		if total == 0 {
 			return textResult("No memories stored in this project yet."), nil, nil
-		}
-		// Walk from highest doc_id down. Give up after 3*k lookups to avoid
-		// pathological scans of heavily-tombstoned indexes.
-		maxLookups := k * 3
-		if maxLookups < 20 {
-			maxLookups = 20
-		}
-		type item struct {
-			docID int
-			text  string
-		}
-		items := make([]item, 0, k)
-		lookups := 0
-		for id := stats.Documents - 1; id >= 0 && len(items) < k && lookups < maxLookups; id-- {
-			lookups++
-			doc, derr := client.GetDocument(ctx, id)
-			if derr != nil {
-				continue // transient — keep walking
-			}
-			if doc == nil || len(doc.Chunks) == 0 {
-				continue // tombstoned
-			}
-			// Concatenate chunk text in chunk-index order (GraphANN already sorts).
-			var txt strings.Builder
-			for i, ch := range doc.Chunks {
-				if i > 0 {
-					txt.WriteString(" ")
-				}
-				txt.WriteString(ch.Text)
-			}
-			items = append(items, item{docID: id, text: stripTagPrefix(txt.String())})
 		}
 		if len(items) == 0 {
 			return textResult("No live memories found in the most recent document range."), nil, nil
 		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "[Memory: %d recent item(s) out of %d total documents]\n",
-			len(items), stats.Documents)
+		fmt.Fprintf(&b, "[Memory: %d recent item(s) out of %d total documents]\n", len(items), total)
 		for i, it := range items {
-			fmt.Fprintf(&b, "%d. (doc %d) %s\n", i+1, it.docID, truncate(it.text, 300))
+			fmt.Fprintf(&b, "%d. (#%d) %s\n", i+1, it.DocID, truncate(it.Text, recallSnippetLen))
 		}
 		return textResult(b.String()), nil, nil
 	})
 }
 
-// docIDFromMetadata extracts the integer document_id from a search result's
-// metadata map. GraphANN returns it as a float64 under JSON decoding.
-func docIDFromMetadata(md map[string]any) (int, bool) {
-	if md == nil {
-		return 0, false
+// ---- helpers ------------------------------------------------------------
+
+// clampK normalises a caller-supplied k to [1, max], falling back to def
+// when the input is non-positive.
+func clampK(k, def, max int) int {
+	if k <= 0 {
+		return def
 	}
-	raw, ok := md["document_id"]
+	return min(k, max)
+}
+
+// requireQuery trims the query and returns an error result when it is empty.
+func requireQuery(raw string) (string, *mcp.CallToolResult) {
+	q := strings.TrimSpace(raw)
+	if q == "" {
+		return "", errorResult("query is required and must be non-empty")
+	}
+	return q, nil
+}
+
+// docIDFromMetadata extracts the integer document_id from a search
+// result's metadata. The SDK types Metadata as `any`; under JSON decoding
+// the live server returns map[string]any with document_id as float64.
+func docIDFromMetadata(md any) (int, bool) {
+	m, ok := md.(map[string]any)
 	if !ok {
 		return 0, false
 	}
-	switch v := raw.(type) {
+	switch v := m["document_id"].(type) {
 	case float64:
 		return int(v), true
 	case int:
@@ -299,7 +220,14 @@ func docIDFromMetadata(md map[string]any) (int, bool) {
 	return 0, false
 }
 
-// ---- formatting helpers -------------------------------------------------
+// hitLabel renders the stable handle of a memory: its document id, falling
+// back to the chunk id when the server sent no document metadata.
+func hitLabel(h Hit) string {
+	if h.HasDoc {
+		return fmt.Sprintf("#%d", h.DocID)
+	}
+	return h.ChunkID
+}
 
 // textResult wraps a plain-text response into an MCP CallToolResult.
 func textResult(s string) *mcp.CallToolResult {
@@ -310,9 +238,8 @@ func textResult(s string) *mcp.CallToolResult {
 
 // errorResult wraps a plain-text error into an MCP CallToolResult with
 // IsError set so the client can distinguish tool-level failures from
-// transport errors. We deliberately do NOT return err from the handler for
-// tool-level failures — that surfaces as a protocol error instead of a
-// readable message to the model.
+// transport errors. Handlers do not return err for tool-level failures:
+// that surfaces as a protocol error instead of a readable message.
 func errorResult(msg string) *mcp.CallToolResult {
 	log.Printf("tool error: %s", msg)
 	return &mcp.CallToolResult{
@@ -321,31 +248,40 @@ func errorResult(msg string) *mcp.CallToolResult {
 	}
 }
 
-// formatSearchResults renders a ranked list with scores and chunk IDs for
-// the memory_search tool. Falls through to a friendly empty-state string.
-func formatSearchResults(query string, resp *SearchResponse) string {
-	if resp == nil || len(resp.Results) == 0 {
+func formatSearchResults(query string, hits []Hit) string {
+	if len(hits) == 0 {
 		return fmt.Sprintf("No memories found for %q.", query)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Found %d memory item(s) for %q:\n", len(resp.Results), query)
-	for i, r := range resp.Results {
+	fmt.Fprintf(&b, "Found %d memory item(s) for %q:\n", len(hits), query)
+	for i, h := range hits {
 		fmt.Fprintf(&b, "\n%d. [score %.3f] %s\n   id: %s\n",
-			i+1, r.Score, truncate(stripTagPrefix(r.Text), 400), r.ID)
+			i+1, h.Score, truncate(stripTagPrefix(h.Text), searchSnippetLen), hitLabel(h))
 	}
 	return b.String()
 }
 
-// formatRecall renders a compact context block for the memory_recall tool.
-// Results are shown one per line with the tag prefix stripped.
-func formatRecall(query string, resp *SearchResponse) string {
-	if resp == nil || len(resp.Results) == 0 {
+func formatRecall(query string, hits []Hit) string {
+	if len(hits) == 0 {
 		return fmt.Sprintf("[Memory] no relevant items for %q.", query)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "[Memory: %d relevant item(s)]\n", len(resp.Results))
-	for i, r := range resp.Results {
-		fmt.Fprintf(&b, "%d. %s\n", i+1, truncate(stripTagPrefix(r.Text), 300))
+	fmt.Fprintf(&b, "[Memory: %d relevant item(s)]\n", len(hits))
+	for i, h := range hits {
+		fmt.Fprintf(&b, "%d. (%s) %s\n", i+1, hitLabel(h), truncate(stripTagPrefix(h.Text), recallSnippetLen))
+	}
+	return b.String()
+}
+
+func formatForgetRefusal(query string, res ForgetResult) string {
+	var b strings.Builder
+	if len(res.Candidates) == 0 {
+		fmt.Fprintf(&b, "Nothing forgotten — %s for %q.", res.Refused, query)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "Refusing to forget — %s.\nCandidates (retry with id):\n", res.Refused)
+	for _, h := range res.Candidates {
+		fmt.Fprintf(&b, "  %s [score %.2f] %s\n", hitLabel(h), h.Score, truncate(stripTagPrefix(h.Text), forgetSnippetLen))
 	}
 	return b.String()
 }

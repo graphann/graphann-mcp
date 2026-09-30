@@ -58,7 +58,10 @@ func TestStripTagPrefix(t *testing.T) {
 		{"[kind:x] hello", "hello"},
 		{"[kind:x tags:a,b] hello world", "hello world"},
 		{"no prefix", "no prefix"},
-		{"[  ] body", "body"},
+		{"[  ] body", "[  ] body"},
+		{"[WIP] fix later", "[WIP] fix later"},
+		{"[kind:x source:a b] hi", "hi"},
+		{"[source:x)] hi", "hi"},
 	}
 	for _, c := range cases {
 		if got := stripTagPrefix(c.in); got != c.out {

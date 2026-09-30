@@ -97,7 +97,7 @@ func encodeMemoryText(kind string, tags []string, source, text string) string {
 		}
 	}
 	if s := strings.TrimSpace(source); s != "" {
-		segs = append(segs, fmt.Sprintf("source:%s", s))
+		segs = append(segs, "source:"+strings.NewReplacer("]", ")", "\n", " ").Replace(s))
 	}
 	if len(segs) == 0 {
 		return text
@@ -109,9 +109,9 @@ func encodeMemoryText(kind string, tags []string, source, text string) string {
 	return prefix.String()
 }
 
-// tagPrefixRe matches the leading `[...]` tag block produced by
-// encodeMemoryText so recall output can strip it for display.
-var tagPrefixRe = regexp.MustCompile(`^\[[^\]]*\]\s*`)
+// tagPrefixRe matches only the tag block produced by encodeMemoryText, so
+// user text that starts with its own bracket ("[WIP] ...") is left intact.
+var tagPrefixRe = regexp.MustCompile(`^\[(?:kind:[^\s\]]+|tags:[^\s\]]+|source:[^\]]*)(?: (?:kind:[^\s\]]+|tags:[^\s\]]+|source:[^\]]*))*\] `)
 
 // stripTagPrefix removes the encoded tag prefix from stored text for
 // human-friendly display. The full text including prefix is still retained
