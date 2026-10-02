@@ -1,0 +1,61 @@
+version: 2
+
+project_name: graphann-mcp
+
+builds:
+  - id: graphann-mcp
+    main: .
+    binary: graphann-mcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: graphann-mcp
+    formats: [tar.gz]
+    name_template: "graphann-mcp-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+
+checksum:
+  name_template: "graphann-mcp-{{ .Version }}-checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^Merge'
+      - '^WIP'
+
+release:
+  github:
+    owner: graphann
+    name: graphann-mcp
+  name_template: "Release {{.Version}}"
+  draft: false
+  prerelease: auto
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
