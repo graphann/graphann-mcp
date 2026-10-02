@@ -31,7 +31,9 @@ The server does not send an API key. Use it with a GraphANN instance that accept
 
 ## Install
 
-Clone the repository and build the binary:
+Download a prebuilt binary from the [GitHub releases](https://github.com/graphann/graphann-mcp/releases) page. Each release has archives for Linux, macOS and Windows on amd64 and arm64, plus a checksum file.
+
+Or clone the repository and build the binary:
 
 ```sh
 git clone git@github.com:graphann/graphann-mcp.git
