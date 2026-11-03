@@ -221,3 +221,156 @@ func TestClampK(t *testing.T) {
 }
 
 var _ graphAPI = (*graphann.Client)(nil)
+
+// New memories carry an external id, so the server can group their chunks and search from them.
+func TestStoreGivesEachMemoryAnExternalID(t *testing.T) {
+	f := newFake()
+	m := readyMemory(t, f)
+	for _, text := range []string{"The billing service uses Postgres.", "Deploys go through ArgoCD."} {
+		if _, err := m.Store(context.Background(), StoreArgs{Text: text}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, b := f.docs[0].externalID, f.docs[1].externalID
+	if !strings.HasPrefix(a, memoryIDPrefix) || !strings.HasPrefix(b, memoryIDPrefix) || a == b {
+		t.Fatalf("external ids = %q, %q; want distinct %q ids", a, b, memoryIDPrefix)
+	}
+}
+
+func TestQueryAsksTheServerToGroupByDocument(t *testing.T) {
+	f := newFake()
+	m := readyMemory(t, f)
+	if _, err := m.Query(context.Background(), "x", 3, queryOpts{Collapse: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Query(context.Background(), "x", 3, queryOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	grouped, raw := f.searches[len(f.searches)-2], f.searches[len(f.searches)-1]
+	if grouped.GroupBy != graphann.SearchGroupByDocument || grouped.MaxPerDoc != 1 {
+		t.Fatalf("collapsing query = %+v, want group_by document, max_per_doc 1", grouped)
+	}
+	if raw.GroupBy != "" {
+		t.Fatalf("raw query groups: %+v", raw)
+	}
+}
+
+func storeAll(t *testing.T, m *Memory, texts ...string) {
+	t.Helper()
+	for _, text := range texts {
+		if _, err := m.Store(context.Background(), StoreArgs{Text: text}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestRelatedSearchesFromTheMemory(t *testing.T) {
+	f := newFake()
+	m := readyMemory(t, f)
+	storeAll(t, m, "billing service postgres database", "billing service invoices postgres", "home cluster argocd deploys")
+	res, err := m.Related(context.Background(), 0, 2, 1)
+	if err != nil || res.Refused != "" || res.Legacy {
+		t.Fatalf("related = %+v err = %v", res, err)
+	}
+	last := f.searches[len(f.searches)-1]
+	if last.RelatedTo != f.docs[0].externalID || last.Query != "" || last.Hops != 0 || last.NovelOnly {
+		t.Fatalf("request = %+v, want a one-hop related search from %q", last, f.docs[0].externalID)
+	}
+	if len(res.Hits) == 0 || res.Hits[0].DocID != 1 {
+		t.Fatalf("hits = %+v, want #1 first", res.Hits)
+	}
+	for _, h := range res.Hits {
+		if h.DocID == 0 {
+			t.Fatal("the source memory must not be its own relative")
+		}
+	}
+}
+
+func TestRelatedWalkNamesTheMemoryItGoesThrough(t *testing.T) {
+	f := newFake()
+	m := readyMemory(t, f)
+	storeAll(t, m, "billing service postgres database", "billing service invoices postgres", "postgres database backups nightly")
+	res, err := m.Related(context.Background(), 0, 5, 2)
+	if err != nil || res.Refused != "" {
+		t.Fatalf("related = %+v err = %v", res, err)
+	}
+	walk := f.searches[len(f.searches)-2]
+	if walk.Hops != 2 || !walk.NovelOnly || walk.Diversity != relatedDiversity {
+		t.Fatalf("walk request = %+v", walk)
+	}
+	var walked *RelatedHit
+	for i := range res.Hits {
+		if len(res.Hits[i].Via) > 0 {
+			walked = &res.Hits[i]
+		}
+	}
+	if walked == nil || walked.Support != 2 {
+		t.Fatalf("no walked hit with a path: %+v", res.Hits)
+	}
+	if walked.Via[0] != 1 {
+		t.Fatalf("via = %v, want #1, the direct neighbour the walk went through", walked.Via)
+	}
+	if lookup := f.searches[len(f.searches)-1]; lookup.RelatedTo != f.docs[0].externalID || lookup.Hops != 0 || lookup.K != relatedFrontierK {
+		t.Fatalf("hop lookup = %+v, want a one-hop related search of the frontier", lookup)
+	}
+}
+
+// A memory stored before external ids has nothing to search from, so it is matched by its text.
+func TestRelatedLegacyMemoryFallsBackToItsText(t *testing.T) {
+	f := newFake()
+	m := readyMemory(t, f)
+	f.docs = append(f.docs, &fakeDoc{chunks: []string{"billing service postgres database"}})
+	storeAll(t, m, "billing service invoices postgres")
+	res, err := m.Related(context.Background(), 0, 3, 2)
+	if err != nil || !res.Legacy {
+		t.Fatalf("related = %+v err = %v, want the legacy path", res, err)
+	}
+	last := f.searches[len(f.searches)-1]
+	if last.RelatedTo != "" || last.Query != "billing service postgres database" {
+		t.Fatalf("legacy request = %+v, want a text query of the memory", last)
+	}
+	if len(res.Hits) != 1 || res.Hits[0].DocID != 1 {
+		t.Fatalf("hits = %+v", res.Hits)
+	}
+}
+
+func TestRelatedUnknownMemoryIsRefused(t *testing.T) {
+	f := newFake()
+	m := readyMemory(t, f)
+	res, err := m.Related(context.Background(), 42, 3, 1)
+	if err != nil || !strings.Contains(res.Refused, "42") {
+		t.Fatalf("related = %+v err = %v", res, err)
+	}
+}
+
+// In a small index every memory is a direct neighbour, so novel_only leaves nothing; the walk
+// then runs once more without it.
+func TestRelatedWalkRetriesWithoutNoveltyOnASmallIndex(t *testing.T) {
+	f := newFake()
+	f.novelEmpty = true
+	m := readyMemory(t, f)
+	storeAll(t, m, "billing service postgres database", "billing service invoices postgres", "postgres database backups nightly")
+	before := len(f.searches)
+	res, err := m.Related(context.Background(), 0, 5, 2)
+	if err != nil || len(res.Hits) == 0 {
+		t.Fatalf("related = %+v err = %v, want hits from the second walk", res, err)
+	}
+	walks := f.searches[before:]
+	if len(walks) < 2 || !walks[0].NovelOnly || walks[1].NovelOnly || walks[1].Hops != relatedWalkHops {
+		t.Fatalf("walks = %+v, want a novel_only walk then a plain walk", walks)
+	}
+}
+
+func TestFormatRelated(t *testing.T) {
+	hit := func(doc int, text string) Hit { return Hit{DocID: doc, HasDoc: true, Text: text, Score: 0.8} }
+	walked := formatRelated(3, RelatedResult{Hits: []RelatedHit{{Hit: hit(7, "backups run nightly"), Via: []int{5}, Support: 2}}})
+	for _, want := range []string{"related to #3", "(#7)", "backups run nightly", "via #5", "(2 paths)"} {
+		if !strings.Contains(walked, want) {
+			t.Fatalf("walk output %q lacks %q", walked, want)
+		}
+	}
+	legacy := formatRelated(3, RelatedResult{Legacy: true})
+	if !strings.Contains(legacy, "predates memory ids") || !strings.Contains(legacy, "nothing related to #3") {
+		t.Fatalf("legacy output = %q", legacy)
+	}
+}

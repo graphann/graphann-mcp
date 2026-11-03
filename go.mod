@@ -3,7 +3,7 @@ module github.com/lukaszraczylo/graphann-mcp
 go 1.26.0
 
 require (
-	github.com/graphann/graphann-client-go v0.10.1
+	github.com/graphann/graphann-client-go v0.11.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 )
 

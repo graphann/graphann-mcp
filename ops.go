@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -39,6 +41,18 @@ const (
 	// recentLookupFactor bounds the document-ID walk in ListRecent.
 	recentLookupFactor = 3
 	recentMinLookups   = 20
+	// memoryIDPrefix marks the external id each new memory gets. The id lets the server
+	// group a memory's chunks and start a related search from it.
+	memoryIDPrefix = "mem_"
+	memoryIDBytes  = 16
+	// relatedDiversity spreads a two-hop walk over different neighbours. On a GraphANN
+	// index with near-duplicate documents, walks returned no new documents below 0.5.
+	relatedDiversity = 0.5
+	// relatedWalkHops is the walk depth that adds novel_only and diversity.
+	relatedWalkHops = 2
+	// relatedFrontierK covers the pool a walk picks its first hops from: the server's
+	// default fanout of 10 times its diverse pool factor of 4.
+	relatedFrontierK = 40
 )
 
 // queryOpts selects retrieval behaviour. The zero value is the raw dense
@@ -96,12 +110,24 @@ func (m *Memory) Query(ctx context.Context, q string, k int, o queryOpts) ([]Hit
 	if o.Collapse {
 		fetch = min(k*oversample, maxFetchK)
 	}
-	resp, err := m.Client.Search(ctx, m.TenantID, m.IndexID, graphann.SearchRequest{Query: q, K: fetch, Hybrid: o.Hybrid})
+	req := graphann.SearchRequest{Query: q, K: fetch, Hybrid: o.Hybrid}
+	if o.Collapse {
+		// The server groups memories that carry an external id; collapseByDoc still
+		// merges the chunks of memories stored before external ids.
+		req.GroupBy, req.MaxPerDoc = graphann.SearchGroupByDocument, 1
+	}
+	resp, err := m.Client.Search(ctx, m.TenantID, m.IndexID, req)
 	if err != nil {
 		return nil, err
 	}
+	return selectHits(resp, k, o), nil
+}
+
+// selectHits keeps the results at or above o.MinScore, collapses them per document when
+// o.Collapse is set, and returns at most k.
+func selectHits(resp *graphann.SearchResponse, k int, o queryOpts) []Hit {
 	if resp == nil {
-		return nil, nil
+		return nil
 	}
 	hits := make([]Hit, 0, len(resp.Results))
 	for _, r := range resp.Results {
@@ -115,7 +141,16 @@ func (m *Memory) Query(ctx context.Context, q string, k int, o queryOpts) ([]Hit
 	if len(hits) > k {
 		hits = hits[:k]
 	}
-	return hits, nil
+	return hits
+}
+
+// newMemoryID returns a random external id for a new memory.
+func newMemoryID() (string, error) {
+	b := make([]byte, memoryIDBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("memory id: %w", err)
+	}
+	return memoryIDPrefix + hex.EncodeToString(b), nil
 }
 
 // StoreResult reports the outcome of Store.
@@ -137,8 +172,12 @@ func (m *Memory) Store(ctx context.Context, args StoreArgs) (StoreResult, error)
 	if dup, ok := m.findDuplicate(ctx, text); ok {
 		return StoreResult{Duplicate: &dup}, nil
 	}
+	id, err := newMemoryID()
+	if err != nil {
+		return StoreResult{}, fmt.Errorf("store: %w", err)
+	}
 	resp, err := m.Client.AddDocuments(ctx, m.TenantID, m.IndexID, graphann.AddDocumentsRequest{
-		Documents: []graphann.Document{{Text: encodeMemoryText(args.Kind, args.Tags, args.Source, text)}},
+		Documents: []graphann.Document{{ID: id, Text: encodeMemoryText(args.Kind, args.Tags, args.Source, text)}},
 	})
 	if err != nil {
 		return StoreResult{}, fmt.Errorf("store: %w", err)
@@ -298,4 +337,139 @@ func joinChunks(chunks []graphann.DocumentChunk) string {
 		b.WriteString(ch.Text)
 	}
 	return b.String()
+}
+
+// RelatedHit is a memory related to the source. Via lists the document ids a walk passed
+// through, and Support counts the walk paths that reached it.
+type RelatedHit struct {
+	Hit
+	Via     []int
+	Support int
+}
+
+// RelatedResult reports the outcome of Related. Refused is non-empty when the source was not
+// found. Legacy means the source has no external id, so it was matched by its text, one hop only.
+type RelatedResult struct {
+	Refused string
+	Source  Hit
+	Hits    []RelatedHit
+	Legacy  bool
+}
+
+// Related returns up to k memories related to the memory with document id id. With hops of
+// 2 it walks through another memory and keeps only memories outside the direct neighbours,
+// which surfaces connections a direct search does not show.
+func (m *Memory) Related(ctx context.Context, id, k, hops int) (RelatedResult, error) {
+	if err := m.Ensure(ctx); err != nil {
+		return RelatedResult{}, fmt.Errorf("bootstrap: %w", err)
+	}
+	doc, err := m.Client.GetDocument(ctx, m.TenantID, m.IndexID, id)
+	if errors.Is(err, graphann.ErrNotFound) {
+		return RelatedResult{Refused: fmt.Sprintf("no memory with document id %d", id)}, nil
+	}
+	if err != nil {
+		return RelatedResult{}, fmt.Errorf("related: lookup failed: %w", err)
+	}
+	src := Hit{DocID: id, HasDoc: true, Text: stripTagPrefix(joinChunks(doc.Chunks))}
+	if doc.ExternalID == "" {
+		hits, err := m.Query(ctx, src.Text, k+1, defaultQueryOpts)
+		if err != nil {
+			return RelatedResult{}, fmt.Errorf("related: %w", err)
+		}
+		return RelatedResult{Source: src, Legacy: true, Hits: withoutSource(hits, id, k)}, nil
+	}
+	req := graphann.SearchRequest{RelatedTo: doc.ExternalID, K: min(k*oversample, maxFetchK)}
+	o := defaultQueryOpts
+	if hops >= relatedWalkHops {
+		// Walk scores multiply the hop scores, so the recall floor would drop every walked memory.
+		req.Hops, req.NovelOnly, req.Diversity = relatedWalkHops, true, relatedDiversity
+		o.MinScore = 0
+	}
+	resp, err := m.Client.Search(ctx, m.TenantID, m.IndexID, req)
+	if err == nil && req.NovelOnly && resp != nil && len(resp.Results) == 0 {
+		// Every memory is a direct neighbour of the source in a small index.
+		req.NovelOnly = false
+		resp, err = m.Client.Search(ctx, m.TenantID, m.IndexID, req)
+	}
+	if errors.Is(err, graphann.ErrNotFound) {
+		return RelatedResult{Refused: fmt.Sprintf("memory #%d is not searchable yet", id)}, nil
+	}
+	if err != nil {
+		return RelatedResult{}, fmt.Errorf("related: %w", err)
+	}
+	hits := withoutSource(selectHits(resp, k+1, o), id, k)
+	if req.Hops >= relatedWalkHops {
+		hits = withPaths(resp.Results, m.hopDocs(ctx, req.RelatedTo, resp.Results), hits)
+	}
+	return RelatedResult{Source: src, Hits: hits}, nil
+}
+
+// hopDocs maps the external ids on walk paths to document ids. A hop is usually a direct
+// neighbour of the source, which novel_only leaves out of the walk results, so one one-hop
+// search of the walk's frontier pool names it. A failed lookup only leaves hops unnamed.
+func (m *Memory) hopDocs(ctx context.Context, source string, walk []graphann.SearchResult) map[string]int {
+	docs := map[string]int{}
+	missing := false
+	for _, r := range walk {
+		if h := toHit(r); h.HasDoc {
+			docs[r.ID] = h.DocID
+		}
+	}
+	for _, r := range walk {
+		for _, hop := range r.Path {
+			if _, ok := docs[hop.ID]; !ok {
+				missing = true
+			}
+		}
+	}
+	if !missing {
+		return docs
+	}
+	resp, err := m.Client.Search(ctx, m.TenantID, m.IndexID, graphann.SearchRequest{RelatedTo: source, K: relatedFrontierK})
+	if err != nil || resp == nil {
+		return docs
+	}
+	for _, r := range resp.Results {
+		if h := toHit(r); h.HasDoc {
+			docs[r.ID] = h.DocID
+		}
+	}
+	return docs
+}
+
+// withoutSource drops the source memory and returns at most k hits.
+func withoutSource(hits []Hit, id, k int) []RelatedHit {
+	out := make([]RelatedHit, 0, k)
+	for _, h := range hits {
+		if h.HasDoc && h.DocID == id {
+			continue
+		}
+		if len(out) == k {
+			break
+		}
+		out = append(out, RelatedHit{Hit: h})
+	}
+	return out
+}
+
+// withPaths adds the walk path and support of each hit. A path names memories by external
+// id; docOf maps each one to a document id, and an unknown one is left out.
+func withPaths(walk []graphann.SearchResult, docOf map[string]int, hits []RelatedHit) []RelatedHit {
+	paths := make(map[string]graphann.SearchResult, len(walk))
+	for _, r := range walk {
+		paths[r.ID] = r
+	}
+	for i := range hits {
+		r, ok := paths[hits[i].ChunkID]
+		if !ok || len(r.Path) < relatedWalkHops {
+			continue
+		}
+		hits[i].Support = r.Support
+		for _, hop := range r.Path[:len(r.Path)-1] {
+			if d, ok := docOf[hop.ID]; ok {
+				hits[i].Via = append(hits[i].Via, d)
+			}
+		}
+	}
+	return hits
 }

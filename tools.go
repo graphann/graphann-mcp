@@ -10,12 +10,14 @@ import (
 )
 
 const (
-	searchDefaultK = 10
-	searchMaxK     = 100
-	recallDefaultK = 5
-	recallMaxK     = 20
-	recentDefaultK = 10
-	recentMaxK     = 50
+	searchDefaultK  = 10
+	searchMaxK      = 100
+	recallDefaultK  = 5
+	recallMaxK      = 20
+	recentDefaultK  = 10
+	recentMaxK      = 50
+	relatedDefaultK = 5
+	relatedMaxK     = 20
 
 	recallSnippetLen = 300
 	searchSnippetLen = 400
@@ -148,6 +150,34 @@ func registerForget(server *mcp.Server, mem *Memory) {
 	})
 }
 
+// ---- memory_related -----------------------------------------------------
+
+// RelatedArgs is the schema for the memory_related tool.
+type RelatedArgs struct {
+	ID   int `json:"id" jsonschema:"document id of the source memory (the #N shown by memory_search, memory_recall and memory_list_recent)"`
+	K    int `json:"k,omitempty" jsonschema:"maximum number of related memories (default 5, max 20)"`
+	Hops int `json:"hops,omitempty" jsonschema:"1 (default) for memories similar to the source; 2 to walk through another memory and surface connections a direct search does not show"`
+}
+
+func registerRelated(server *mcp.Server, mem *Memory) {
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "memory_related",
+		Description: "Find memories related to one stored memory, by its document id, without writing a query. " +
+			"hops=1 returns the memories most similar to it. hops=2 walks through another memory and returns memories " +
+			"outside its direct neighbours, each with the memory it was reached through: use it to find non-obvious links. " +
+			"Memories stored before this tool existed are matched by their text, one hop only.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args RelatedArgs) (*mcp.CallToolResult, any, error) {
+		res, err := mem.Related(ctx, args.ID, clampK(args.K, relatedDefaultK, relatedMaxK), args.Hops)
+		if err != nil {
+			return errorResult(err.Error()), nil, nil
+		}
+		if res.Refused != "" {
+			return textResult("Nothing related — " + res.Refused + "."), nil, nil
+		}
+		return textResult(formatRelated(args.ID, res)), nil, nil
+	})
+}
+
 // ---- memory_list_recent -------------------------------------------------
 
 // ListRecentArgs is the schema for the memory_list_recent tool.
@@ -269,6 +299,33 @@ func formatRecall(query string, hits []Hit) string {
 	fmt.Fprintf(&b, "[Memory: %d relevant item(s)]\n", len(hits))
 	for i, h := range hits {
 		fmt.Fprintf(&b, "%d. (%s) %s\n", i+1, hitLabel(h), truncate(stripTagPrefix(h.Text), recallSnippetLen))
+	}
+	return b.String()
+}
+
+func formatRelated(id int, res RelatedResult) string {
+	var b strings.Builder
+	if res.Legacy {
+		fmt.Fprintf(&b, "(#%d predates memory ids: matched by its text, one hop only)\n", id)
+	}
+	if len(res.Hits) == 0 {
+		fmt.Fprintf(&b, "[Memory] nothing related to #%d.", id)
+		return b.String()
+	}
+	fmt.Fprintf(&b, "[Memory: %d item(s) related to #%d]\n", len(res.Hits), id)
+	for i, h := range res.Hits {
+		fmt.Fprintf(&b, "%d. (%s) [score %.3f] %s", i+1, hitLabel(h.Hit), h.Score, truncate(stripTagPrefix(h.Text), recallSnippetLen))
+		if len(h.Via) > 0 {
+			via := make([]string, len(h.Via))
+			for j, d := range h.Via {
+				via[j] = fmt.Sprintf("#%d", d)
+			}
+			fmt.Fprintf(&b, " — via %s", strings.Join(via, ", "))
+		}
+		if h.Support > 1 {
+			fmt.Fprintf(&b, " (%d paths)", h.Support)
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
 }

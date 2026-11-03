@@ -17,11 +17,15 @@ type fakeAPI struct {
 	scores    map[string]float32 // chunk text -> forced score
 	failTimes int                // GetTenant failures before success
 	searches  []graphann.SearchRequest
+	// novelEmpty answers a novel_only walk with nothing, as the server does when every
+	// memory is a direct neighbour of the source.
+	novelEmpty bool
 }
 
 type fakeDoc struct {
-	chunks  []string
-	deleted bool
+	externalID string
+	chunks     []string
+	deleted    bool
 }
 
 func newFake() *fakeAPI {
@@ -64,27 +68,48 @@ func (f *fakeAPI) CreateIndex(_ context.Context, tenantID string, r graphann.Cre
 func (f *fakeAPI) AddDocuments(_ context.Context, _, _ string, r graphann.AddDocumentsRequest) (*graphann.AddDocumentsResponse, error) {
 	resp := &graphann.AddDocumentsResponse{}
 	for _, d := range r.Documents {
-		f.docs = append(f.docs, &fakeDoc{chunks: []string{d.Text}})
+		f.docs = append(f.docs, &fakeDoc{externalID: d.ID, chunks: []string{d.Text}})
 		resp.Added++
 		resp.ChunkIDs = append(resp.ChunkIDs, fmt.Sprintf("chunk-%d", len(f.docs)-1))
 	}
 	return resp, nil
 }
 
+// Search ranks by word overlap with the query. A related search ranks by overlap with the
+// source document's text, leaves the source out, and answers ErrNotFound for an unknown
+// external id, as the server does. A walk puts the source's best other match on each path.
 func (f *fakeAPI) Search(_ context.Context, _, _ string, r graphann.SearchRequest) (*graphann.SearchResponse, error) {
 	f.searches = append(f.searches, r)
+	if r.NovelOnly && f.novelEmpty {
+		return &graphann.SearchResponse{}, nil
+	}
+	query, source := r.Query, -1
+	if r.RelatedTo != "" {
+		for id, d := range f.docs {
+			if !d.deleted && d.externalID == r.RelatedTo {
+				source, query = id, strings.Join(d.chunks, " ")
+			}
+		}
+		if source < 0 {
+			return nil, graphann.ErrNotFound
+		}
+	}
 	var all []graphann.SearchResult
 	for id, d := range f.docs {
-		if d.deleted {
+		if d.deleted || id == source {
 			continue
 		}
 		for ci, c := range d.chunks {
 			sc, ok := f.scores[c]
 			if !ok {
-				sc = overlap(r.Query, c)
+				sc = overlap(query, c)
+			}
+			rid := d.externalID
+			if rid == "" {
+				rid = fmt.Sprintf("c%d-%d", id, ci)
 			}
 			all = append(all, graphann.SearchResult{
-				ID: fmt.Sprintf("c%d-%d", id, ci), Text: c, Score: sc,
+				ID: rid, Text: c, Score: sc,
 				Metadata: map[string]any{"document_id": float64(id), "chunk_index": float64(ci)},
 			})
 		}
@@ -99,6 +124,16 @@ func (f *fakeAPI) Search(_ context.Context, _, _ string, r graphann.SearchReques
 	if len(all) > r.K {
 		all = all[:r.K]
 	}
+	if r.Hops >= 2 && len(all) > 1 {
+		via := all[0]
+		for i := 1; i < len(all); i++ {
+			all[i].Path = []graphann.RelatedHop{{ID: via.ID, Score: via.Score}, {ID: all[i].ID, Score: all[i].Score}}
+			all[i].Support = 2
+		}
+		if r.NovelOnly {
+			all = all[1:] // the first hop is a direct neighbour, which novel_only leaves out
+		}
+	}
 	return &graphann.SearchResponse{Results: all, Total: len(all)}, nil
 }
 
@@ -106,7 +141,7 @@ func (f *fakeAPI) GetDocument(_ context.Context, _, _ string, id int) (*graphann
 	if id < 0 || id >= len(f.docs) || f.docs[id].deleted {
 		return nil, graphann.ErrNotFound
 	}
-	out := &graphann.DocumentResponse{DocumentID: id}
+	out := &graphann.DocumentResponse{DocumentID: id, ExternalID: f.docs[id].externalID}
 	for i, c := range f.docs[id].chunks {
 		out.Chunks = append(out.Chunks, graphann.DocumentChunk{Text: c, ChunkIndex: i})
 	}
