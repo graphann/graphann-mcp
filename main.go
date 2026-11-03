@@ -92,6 +92,7 @@ func main() {
 	registerRecall(server, mem)
 	registerForget(server, mem)
 	registerListRecent(server, mem)
+	registerRelated(server, mem)
 
 	if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		log.Fatalf("server exited: %v", err)

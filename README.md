@@ -165,8 +165,9 @@ Do nothing. The default index follows the project directory name. Two directorie
 | `memory_search` | Search with scores and ids, for inspection. |
 | `memory_list_recent` | List the newest memories. |
 | `memory_forget` | Delete a memory by id or by query. |
+| `memory_related` | Find memories related to one memory, or linked to it through another memory. |
 
-Each result shows a document id such as `#3`. Use this id with `memory_forget`.
+Each result shows a document id such as `#3`. Use this id with `memory_forget` and `memory_related`.
 
 ### memory_store
 
@@ -206,6 +207,18 @@ Search returns one result per memory with its score and id. It has no score floo
 | `k` | integer | no | 10 | 50 |
 
 GraphANN has no time-ordered listing. The server walks document ids from newest to oldest and skips deleted ones. It gives up after `max(3 × k, 20)` lookups on an index with many deletions.
+
+### memory_related
+
+| Argument | Type | Required | Default | Limit |
+|----------|------|----------|---------|-------|
+| `id` | integer | yes | none | none |
+| `k` | integer | no | 5 | 20 |
+| `hops` | integer | no | 1 | 2 |
+
+`hops` of 1 returns the memories most similar to memory `id`, with the recall score floor. `hops` of 2 runs a GraphANN related walk: it goes through another memory and returns memories outside the direct neighbours, each with the memory it went through (`via #5`) and the number of paths that reached it. If the walk finds no memory outside the direct neighbours, the server walks again without that rule.
+
+Each new memory gets an external id (`mem_…`), which the walk starts from. A memory stored before this version has none: it is matched by its own text, one hop only, and the result says so.
 
 ### memory_forget
 
